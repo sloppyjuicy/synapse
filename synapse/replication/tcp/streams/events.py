@@ -13,12 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import heapq
-from collections.abc import Iterable
-from typing import TYPE_CHECKING, List, Optional, Tuple, Type
+from collections import defaultdict
+from typing import TYPE_CHECKING, Iterable, Optional, Tuple, Type, TypeVar, cast
 
 import attr
 
-from ._base import Stream, StreamUpdateResult, Token
+from synapse.replication.tcp.streams._base import (
+    StreamRow,
+    StreamUpdateResult,
+    Token,
+    _StreamFromIdGen,
+)
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
@@ -47,15 +52,29 @@ data part are:
  * The state_key of the state which has changed
  * The event id of the new state
 
+A "state-all" row is sent whenever the "current state" in a room changes, but there are
+too many state updates for a particular room in the same update. This replaces any
+"state" rows on a per-room basis. The fields in the data part are:
+
+* The room id for the state changes
+
 """
 
+# Any room with more than _MAX_STATE_UPDATES_PER_ROOM will send a EventsStreamAllStateRow
+# instead of individual EventsStreamEventRow. This is predominantly useful when
+# purging large rooms.
+_MAX_STATE_UPDATES_PER_ROOM = 150
 
-@attr.s(slots=True, frozen=True)
+
+@attr.s(slots=True, frozen=True, auto_attribs=True)
 class EventsStreamRow:
     """A parsed row from the events replication stream"""
 
-    type = attr.ib()  # str: the TypeId of one of the *EventsStreamRows
-    data = attr.ib()  # BaseEventsStreamRow
+    type: str  # the TypeId of one of the *EventsStreamRows
+    data: "BaseEventsStreamRow"
+
+
+T = TypeVar("T", bound="BaseEventsStreamRow")
 
 
 class BaseEventsStreamRow:
@@ -68,7 +87,7 @@ class BaseEventsStreamRow:
     TypeId: str
 
     @classmethod
-    def from_data(cls, data):
+    def from_data(cls: Type[T], data: Iterable[Optional[str]]) -> T:
         """Parse the data from the replication stream into a row.
 
         By default we just call the constructor with the data list as arguments
@@ -79,49 +98,56 @@ class BaseEventsStreamRow:
         return cls(*data)
 
 
-@attr.s(slots=True, frozen=True)
+@attr.s(slots=True, frozen=True, auto_attribs=True)
 class EventsStreamEventRow(BaseEventsStreamRow):
     TypeId = "ev"
 
-    event_id = attr.ib(type=str)
-    room_id = attr.ib(type=str)
-    type = attr.ib(type=str)
-    state_key = attr.ib(type=Optional[str])
-    redacts = attr.ib(type=Optional[str])
-    relates_to = attr.ib(type=Optional[str])
-    membership = attr.ib(type=Optional[str])
-    rejected = attr.ib(type=bool)
+    event_id: str
+    room_id: str
+    type: str
+    state_key: Optional[str]
+    redacts: Optional[str]
+    relates_to: Optional[str]
+    membership: Optional[str]
+    rejected: bool
+    outlier: bool
 
 
-@attr.s(slots=True, frozen=True)
+@attr.s(slots=True, frozen=True, auto_attribs=True)
 class EventsStreamCurrentStateRow(BaseEventsStreamRow):
     TypeId = "state"
 
-    room_id = attr.ib()  # str
-    type = attr.ib()  # str
-    state_key = attr.ib()  # str
-    event_id = attr.ib()  # str, optional
+    room_id: str
+    type: str
+    state_key: str
+    event_id: Optional[str]
+
+
+@attr.s(slots=True, frozen=True, auto_attribs=True)
+class EventsStreamAllStateRow(BaseEventsStreamRow):
+    TypeId = "state-all"
+
+    room_id: str
 
 
 _EventRows: Tuple[Type[BaseEventsStreamRow], ...] = (
     EventsStreamEventRow,
     EventsStreamCurrentStateRow,
+    EventsStreamAllStateRow,
 )
 
 TypeToRow = {Row.TypeId: Row for Row in _EventRows}
 
 
-class EventsStream(Stream):
+class EventsStream(_StreamFromIdGen):
     """We received a new event, or an event went from being an outlier to not"""
 
     NAME = "events"
 
     def __init__(self, hs: "HomeServer"):
-        self._store = hs.get_datastore()
+        self._store = hs.get_datastores().main
         super().__init__(
-            hs.get_instance_name(),
-            self._store._stream_id_gen.get_current_token_for_writer,
-            self._update_function,
+            hs.get_instance_name(), self._update_function, self._store._stream_id_gen
         )
 
     async def _update_function(
@@ -131,6 +157,11 @@ class EventsStream(Stream):
         current_token: Token,
         target_row_count: int,
     ) -> StreamUpdateResult:
+        # The events stream cannot be "reset", so its safe to return early if
+        # the from token is larger than the current token (the DB query will
+        # trivially return 0 rows anyway).
+        if from_token >= current_token:
+            return [], current_token, False
 
         # the events stream merges together three separate sources:
         #  * new events
@@ -157,7 +188,7 @@ class EventsStream(Stream):
 
         # now we fetch up to that many rows from the events table
 
-        event_rows: List[Tuple] = await self._store.get_all_new_forward_event_rows(
+        event_rows = await self._store.get_all_new_forward_event_rows(
             instance_name, from_token, current_token, target_row_count
         )
 
@@ -191,7 +222,7 @@ class EventsStream(Stream):
         # finally, fetch the ex-outliers rows. We assume there are few enough of these
         # not to bother with the limit.
 
-        ex_outliers_rows: List[Tuple] = await self._store.get_ex_outlier_stream_rows(
+        ex_outliers_rows = await self._store.get_ex_outlier_stream_rows(
             instance_name, from_token, upper_limit
         )
 
@@ -206,9 +237,28 @@ class EventsStream(Stream):
             if stream_id <= upper_limit
         )
 
+        # Separate out rooms that have many state updates, listeners should clear
+        # all state for those rooms.
+        state_updates_by_room = defaultdict(list)
+        for stream_id, room_id, _type, _state_key, _event_id in state_rows:
+            state_updates_by_room[room_id].append(stream_id)
+
+        state_all_rows = [
+            (stream_ids[-1], room_id)
+            for room_id, stream_ids in state_updates_by_room.items()
+            if len(stream_ids) >= _MAX_STATE_UPDATES_PER_ROOM
+        ]
+        state_all_updates: Iterable[Tuple[int, Tuple]] = (
+            (max_stream_id, (EventsStreamAllStateRow.TypeId, (room_id,)))
+            for (max_stream_id, room_id) in state_all_rows
+        )
+
+        # Any remaining state updates are sent individually.
+        state_all_rooms = {room_id for _, room_id in state_all_rows}
         state_updates: Iterable[Tuple[int, Tuple]] = (
             (stream_id, (EventsStreamCurrentStateRow.TypeId, rest))
             for (stream_id, *rest) in state_rows
+            if rest[0] not in state_all_rooms
         )
 
         ex_outliers_updates: Iterable[Tuple[int, Tuple]] = (
@@ -217,11 +267,15 @@ class EventsStream(Stream):
         )
 
         # we need to return a sorted list, so merge them together.
-        updates = list(heapq.merge(event_updates, state_updates, ex_outliers_updates))
+        updates = list(
+            heapq.merge(
+                event_updates, state_all_updates, state_updates, ex_outliers_updates
+            )
+        )
         return updates, upper_limit, limited
 
     @classmethod
-    def parse_row(cls, row):
-        (typ, data) = row
-        data = TypeToRow[typ].from_data(data)
-        return EventsStreamRow(typ, data)
+    def parse_row(cls, row: StreamRow) -> "EventsStreamRow":
+        (typ, data) = cast(Tuple[str, Iterable[Optional[str]]], row)
+        event_stream_row_data = TypeToRow[typ].from_data(data)
+        return EventsStreamRow(typ, event_stream_row_data)

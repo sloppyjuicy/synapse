@@ -13,29 +13,33 @@
 # limitations under the License.
 
 import logging
+from typing import TYPE_CHECKING, Tuple
 
 from synapse.api.errors import SynapseError
+from synapse.http.server import HttpServer
 from synapse.http.servlet import RestServlet, parse_json_object_from_request
+from synapse.http.site import SynapseRequest
+from synapse.types import JsonMapping
 
 from ._base import client_patterns
+
+if TYPE_CHECKING:
+    from synapse.server import HomeServer
 
 logger = logging.getLogger(__name__)
 
 
 class UserDirectorySearchRestServlet(RestServlet):
     PATTERNS = client_patterns("/user_directory/search$")
+    CATEGORY = "User directory search requests"
 
-    def __init__(self, hs):
-        """
-        Args:
-            hs (synapse.server.HomeServer): server
-        """
+    def __init__(self, hs: "HomeServer"):
         super().__init__()
         self.hs = hs
         self.auth = hs.get_auth()
         self.user_directory_handler = hs.get_user_directory_handler()
 
-    async def on_POST(self, request):
+    async def on_POST(self, request: SynapseRequest) -> Tuple[int, JsonMapping]:
         """Searches for users in directory
 
         Returns:
@@ -55,13 +59,13 @@ class UserDirectorySearchRestServlet(RestServlet):
         requester = await self.auth.get_user_by_req(request, allow_guest=False)
         user_id = requester.user.to_string()
 
-        if not self.hs.config.user_directory_search_enabled:
+        if not self.hs.config.userdirectory.user_directory_search_enabled:
             return 200, {"limited": False, "results": []}
 
         body = parse_json_object_from_request(request)
 
-        limit = body.get("limit", 10)
-        limit = min(limit, 50)
+        limit = int(body.get("limit", 10))
+        limit = max(min(limit, 50), 0)
 
         try:
             search_term = body["search_term"]
@@ -75,5 +79,5 @@ class UserDirectorySearchRestServlet(RestServlet):
         return 200, results
 
 
-def register_servlets(hs, http_server):
+def register_servlets(hs: "HomeServer", http_server: HttpServer) -> None:
     UserDirectorySearchRestServlet(hs).register(http_server)

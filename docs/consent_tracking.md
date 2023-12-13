@@ -8,9 +8,9 @@ to the server until they have.
 There are several parts to this functionality; each requires some specific
 configuration in `homeserver.yaml` to be enabled.
 
-Note that various parts of the configuation and this document refer to the
+Note that various parts of the configuration and this document refer to the
 "privacy policy": agreement with a privacy policy is one particular use of this
-feature, but of course adminstrators can specify other terms and conditions
+feature, but of course administrators can specify other terms and conditions
 unrelated to "privacy" per se.
 
 Collecting policy agreement from a user
@@ -99,7 +99,7 @@ construct URIs where users can give their consent.
    see if an unauthenticated user is viewing the page. This is typically
    wrapped around the form that would be used to actually agree to the document:
 
-   ```
+   ```html
    {% if not public_version %}
      <!-- The variables used here are only provided when the 'u' param is given to the homeserver -->
      <form method="post" action="consent">

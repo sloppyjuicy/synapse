@@ -14,13 +14,20 @@
 # limitations under the License.
 import logging
 from collections import Counter
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Counter as CounterType,
+    Dict,
+    Iterable,
+    Optional,
+    Tuple,
+)
 
-from typing_extensions import Counter as CounterType
-
-from synapse.api.constants import EventTypes, Membership
+from synapse.api.constants import EventContentFields, EventTypes, Membership
 from synapse.metrics import event_processing_positions
 from synapse.metrics.background_process_metrics import run_as_background_process
+from synapse.storage.databases.main.state_deltas import StateDelta
 from synapse.types import JsonDict
 
 if TYPE_CHECKING:
@@ -39,14 +46,14 @@ class StatsHandler:
 
     def __init__(self, hs: "HomeServer"):
         self.hs = hs
-        self.store = hs.get_datastore()
+        self.store = hs.get_datastores().main
+        self._storage_controllers = hs.get_storage_controllers()
         self.state = hs.get_state_handler()
-        self.server_name = hs.hostname
         self.clock = hs.get_clock()
         self.notifier = hs.get_notifier()
         self.is_mine_id = hs.is_mine_id
 
-        self.stats_enabled = hs.config.stats_enabled
+        self.stats_enabled = hs.config.stats.stats_enabled
 
         # The current position in the current_state_delta stream
         self.pos: Optional[int] = None
@@ -54,7 +61,7 @@ class StatsHandler:
         # Guard to ensure we only process deltas one at a time
         self._is_processing = False
 
-        if self.stats_enabled and hs.config.run_background_tasks:
+        if self.stats_enabled and hs.config.worker.run_background_tasks:
             self.notifier.add_replication_callback(self.notify_new_event)
 
             # We kick this off so that we don't have to wait for a change before
@@ -68,7 +75,7 @@ class StatsHandler:
 
         self._is_processing = True
 
-        async def process():
+        async def process() -> None:
             try:
                 await self._unsafe_process()
             finally:
@@ -80,6 +87,17 @@ class StatsHandler:
         # If self.pos is None then means we haven't fetched it from DB
         if self.pos is None:
             self.pos = await self.store.get_stats_positions()
+            room_max_stream_ordering = self.store.get_room_max_stream_ordering()
+            if self.pos > room_max_stream_ordering:
+                # apparently, we've processed more events than exist in the database!
+                # this can happen if events are removed with history purge or similar.
+                logger.warning(
+                    "Event stream ordering appears to have gone backwards (%i -> %i): "
+                    "rewinding stats processor",
+                    self.pos,
+                    room_max_stream_ordering,
+                )
+                self.pos = room_max_stream_ordering
 
         # Loop round handling deltas until we're up to date
 
@@ -94,7 +112,10 @@ class StatsHandler:
             logger.debug(
                 "Processing room stats %s->%s", self.pos, room_max_stream_ordering
             )
-            max_pos, deltas = await self.store.get_current_state_deltas(
+            (
+                max_pos,
+                deltas,
+            ) = await self._storage_controllers.state.get_current_state_deltas(
                 self.pos, room_max_stream_ordering
             )
 
@@ -122,7 +143,7 @@ class StatsHandler:
             self.pos = max_pos
 
     async def _handle_deltas(
-        self, deltas: Iterable[JsonDict]
+        self, deltas: Iterable[StateDelta]
     ) -> Tuple[Dict[str, CounterType[str]], Dict[str, CounterType[str]]]:
         """Called with the state deltas to process
 
@@ -137,51 +158,50 @@ class StatsHandler:
         room_to_state_updates: Dict[str, Dict[str, Any]] = {}
 
         for delta in deltas:
-            typ = delta["type"]
-            state_key = delta["state_key"]
-            room_id = delta["room_id"]
-            event_id = delta["event_id"]
-            stream_id = delta["stream_id"]
-            prev_event_id = delta["prev_event_id"]
+            logger.debug(
+                "Handling: %r, %r %r, %s",
+                delta.room_id,
+                delta.event_type,
+                delta.state_key,
+                delta.event_id,
+            )
 
-            logger.debug("Handling: %r, %r %r, %s", room_id, typ, state_key, event_id)
-
-            token = await self.store.get_earliest_token_for_stats("room", room_id)
+            token = await self.store.get_earliest_token_for_stats("room", delta.room_id)
 
             # If the earliest token to begin from is larger than our current
             # stream ID, skip processing this delta.
-            if token is not None and token >= stream_id:
+            if token is not None and token >= delta.stream_id:
                 logger.debug(
                     "Ignoring: %s as earlier than this room's initial ingestion event",
-                    event_id,
+                    delta.event_id,
                 )
                 continue
 
-            if event_id is None and prev_event_id is None:
+            if delta.event_id is None and delta.prev_event_id is None:
                 logger.error(
                     "event ID is None and so is the previous event ID. stream_id: %s",
-                    stream_id,
+                    delta.stream_id,
                 )
                 continue
 
             event_content: JsonDict = {}
 
-            if event_id is not None:
-                event = await self.store.get_event(event_id, allow_none=True)
+            if delta.event_id is not None:
+                event = await self.store.get_event(delta.event_id, allow_none=True)
                 if event:
                     event_content = event.content or {}
 
             # All the values in this dict are deltas (RELATIVE changes)
-            room_stats_delta = room_to_stats_deltas.setdefault(room_id, Counter())
+            room_stats_delta = room_to_stats_deltas.setdefault(delta.room_id, Counter())
 
-            room_state = room_to_state_updates.setdefault(room_id, {})
+            room_state = room_to_state_updates.setdefault(delta.room_id, {})
 
-            if prev_event_id is None:
+            if delta.prev_event_id is None:
                 # this state event doesn't overwrite another,
                 # so it is a new effective/current state event
                 room_stats_delta["current_state_events"] += 1
 
-            if typ == EventTypes.Member:
+            if delta.event_type == EventTypes.Member:
                 # we could use StateDeltasHandler._get_key_change here but it's
                 # a bit inefficient given we're not testing for a specific
                 # result; might as well just grab the prev_membership and
@@ -190,9 +210,9 @@ class StatsHandler:
                 # in the absence of a previous event because we do not want to
                 # reduce the leave count when a new-to-the-room user joins.
                 prev_membership = None
-                if prev_event_id is not None:
+                if delta.prev_event_id is not None:
                     prev_event = await self.store.get_event(
-                        prev_event_id, allow_none=True
+                        delta.prev_event_id, allow_none=True
                     )
                     if prev_event:
                         prev_event_content = prev_event.content
@@ -236,7 +256,7 @@ class StatsHandler:
                 else:
                     raise ValueError("%r is not a valid membership" % (membership,))
 
-                user_id = state_key
+                user_id = delta.state_key
                 if self.is_mine_id(user_id):
                     # this accounts for transitions like leave → ban and so on.
                     has_changed_joinedness = (prev_membership == Membership.JOIN) != (
@@ -252,28 +272,33 @@ class StatsHandler:
 
                         room_stats_delta["local_users_in_room"] += membership_delta
 
-            elif typ == EventTypes.Create:
+            elif delta.event_type == EventTypes.Create:
                 room_state["is_federatable"] = (
-                    event_content.get("m.federate", True) is True
+                    event_content.get(EventContentFields.FEDERATE, True) is True
                 )
-            elif typ == EventTypes.JoinRules:
+                room_type = event_content.get(EventContentFields.ROOM_TYPE)
+                if isinstance(room_type, str):
+                    room_state["room_type"] = room_type
+            elif delta.event_type == EventTypes.JoinRules:
                 room_state["join_rules"] = event_content.get("join_rule")
-            elif typ == EventTypes.RoomHistoryVisibility:
+            elif delta.event_type == EventTypes.RoomHistoryVisibility:
                 room_state["history_visibility"] = event_content.get(
                     "history_visibility"
                 )
-            elif typ == EventTypes.RoomEncryption:
+            elif delta.event_type == EventTypes.RoomEncryption:
                 room_state["encryption"] = event_content.get("algorithm")
-            elif typ == EventTypes.Name:
+            elif delta.event_type == EventTypes.Name:
                 room_state["name"] = event_content.get("name")
-            elif typ == EventTypes.Topic:
+            elif delta.event_type == EventTypes.Topic:
                 room_state["topic"] = event_content.get("topic")
-            elif typ == EventTypes.RoomAvatar:
+            elif delta.event_type == EventTypes.RoomAvatar:
                 room_state["avatar"] = event_content.get("url")
-            elif typ == EventTypes.CanonicalAlias:
+            elif delta.event_type == EventTypes.CanonicalAlias:
                 room_state["canonical_alias"] = event_content.get("alias")
-            elif typ == EventTypes.GuestAccess:
-                room_state["guest_access"] = event_content.get("guest_access")
+            elif delta.event_type == EventTypes.GuestAccess:
+                room_state["guest_access"] = event_content.get(
+                    EventContentFields.GUEST_ACCESS
+                )
 
         for room_id, state in room_to_state_updates.items():
             logger.debug("Updating room_stats_state for %s: %s", room_id, state)

@@ -13,15 +13,20 @@
 # limitations under the License.
 
 import logging
-from typing import Dict, List
+from typing import List, Optional, Tuple, cast
 
 from synapse.api.errors import SynapseError
-from synapse.storage._base import SQLBaseStore
+from synapse.storage.database import LoggingTransaction
+from synapse.storage.databases.main import CacheInvalidationWorkerStore
+from synapse.storage.databases.main.event_federation import EventFederationWorkerStore
 
 logger = logging.getLogger(__name__)
 
 
-class EventForwardExtremitiesStore(SQLBaseStore):
+class EventForwardExtremitiesStore(
+    EventFederationWorkerStore,
+    CacheInvalidationWorkerStore,
+):
     async def delete_forward_extremities_for_room(self, room_id: str) -> int:
         """Delete any extra forward extremities for a room.
 
@@ -31,7 +36,7 @@ class EventForwardExtremitiesStore(SQLBaseStore):
         Returns count deleted.
         """
 
-        def delete_forward_extremities_for_room_txn(txn):
+        def delete_forward_extremities_for_room_txn(txn: LoggingTransaction) -> int:
             # First we need to get the event_id to not delete
             sql = """
                 SELECT event_id FROM event_forward_extremities
@@ -61,13 +66,15 @@ class EventForwardExtremitiesStore(SQLBaseStore):
             """
 
             txn.execute(sql, (event_id, room_id))
+
+            deleted_count = txn.rowcount
             logger.info(
                 "Deleted %s extra forward extremities for room %s",
-                txn.rowcount,
+                deleted_count,
                 room_id,
             )
 
-            if txn.rowcount > 0:
+            if deleted_count > 0:
                 # Invalidate the cache
                 self._invalidate_cache_and_stream(
                     txn,
@@ -75,17 +82,26 @@ class EventForwardExtremitiesStore(SQLBaseStore):
                     (room_id,),
                 )
 
-            return txn.rowcount
+            return deleted_count
 
         return await self.db_pool.runInteraction(
             "delete_forward_extremities_for_room",
             delete_forward_extremities_for_room_txn,
         )
 
-    async def get_forward_extremities_for_room(self, room_id: str) -> List[Dict]:
-        """Get list of forward extremities for a room."""
+    async def get_forward_extremities_for_room(
+        self, room_id: str
+    ) -> List[Tuple[str, int, int, Optional[int]]]:
+        """
+        Get list of forward extremities for a room.
 
-        def get_forward_extremities_for_room_txn(txn):
+        Returns:
+            A list of tuples of event_id, state_group, depth, and received_ts.
+        """
+
+        def get_forward_extremities_for_room_txn(
+            txn: LoggingTransaction,
+        ) -> List[Tuple[str, int, int, Optional[int]]]:
             sql = """
                 SELECT event_id, state_group, depth, received_ts
                 FROM event_forward_extremities
@@ -95,7 +111,7 @@ class EventForwardExtremitiesStore(SQLBaseStore):
             """
 
             txn.execute(sql, (room_id,))
-            return self.db_pool.cursor_to_dict(txn)
+            return cast(List[Tuple[str, int, int, Optional[int]]], txn.fetchall())
 
         return await self.db_pool.runInteraction(
             "get_forward_extremities_for_room",

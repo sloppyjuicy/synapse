@@ -18,11 +18,14 @@ allowed to be sent by which side.
 """
 import abc
 import logging
-from typing import Tuple, Type
+from typing import List, Optional, Tuple, Type, TypeVar
 
+from synapse.replication.tcp.streams._base import StreamRow
 from synapse.util import json_decoder, json_encoder
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T", bound="Command")
 
 
 class Command(metaclass=abc.ABCMeta):
@@ -38,7 +41,7 @@ class Command(metaclass=abc.ABCMeta):
 
     @classmethod
     @abc.abstractmethod
-    def from_line(cls, line):
+    def from_line(cls: Type[T], line: str) -> T:
         """Deserialises a line from the wire into this command. `line` does not
         include the command.
         """
@@ -49,21 +52,35 @@ class Command(metaclass=abc.ABCMeta):
         prefix.
         """
 
-    def get_logcontext_id(self):
+    def get_logcontext_id(self) -> str:
         """Get a suitable string for the logcontext when processing this command"""
 
         # by default, we just use the command name.
         return self.NAME
 
+    def redis_channel_name(self, prefix: str) -> str:
+        """
+        Returns the Redis channel name upon which to publish this command.
+
+        Args:
+            prefix: The prefix for the channel.
+        """
+        return prefix
+
+
+SC = TypeVar("SC", bound="_SimpleCommand")
+
 
 class _SimpleCommand(Command):
     """An implementation of Command whose argument is just a 'data' string."""
 
-    def __init__(self, data):
+    __slots__ = ["data"]
+
+    def __init__(self, data: str):
         self.data = data
 
     @classmethod
-    def from_line(cls, line):
+    def from_line(cls: Type[SC], line: str) -> SC:
         return cls(line)
 
     def to_line(self) -> str:
@@ -107,16 +124,20 @@ class RdataCommand(Command):
         RDATA presence master 59 ["@baz:example.com", "online", ...]
     """
 
+    __slots__ = ["stream_name", "instance_name", "token", "row"]
+
     NAME = "RDATA"
 
-    def __init__(self, stream_name, instance_name, token, row):
+    def __init__(
+        self, stream_name: str, instance_name: str, token: Optional[int], row: StreamRow
+    ):
         self.stream_name = stream_name
         self.instance_name = instance_name
         self.token = token
         self.row = row
 
     @classmethod
-    def from_line(cls, line):
+    def from_line(cls: Type["RdataCommand"], line: str) -> "RdataCommand":
         stream_name, instance_name, token, row_json = line.split(" ", 3)
         return cls(
             stream_name,
@@ -125,7 +146,7 @@ class RdataCommand(Command):
             json_decoder.decode(row_json),
         )
 
-    def to_line(self):
+    def to_line(self) -> str:
         return " ".join(
             (
                 self.stream_name,
@@ -135,7 +156,7 @@ class RdataCommand(Command):
             )
         )
 
-    def get_logcontext_id(self):
+    def get_logcontext_id(self) -> str:
         return "RDATA-" + self.stream_name
 
 
@@ -162,20 +183,24 @@ class PositionCommand(Command):
     of the stream.
     """
 
+    __slots__ = ["stream_name", "instance_name", "prev_token", "new_token"]
+
     NAME = "POSITION"
 
-    def __init__(self, stream_name, instance_name, prev_token, new_token):
+    def __init__(
+        self, stream_name: str, instance_name: str, prev_token: int, new_token: int
+    ):
         self.stream_name = stream_name
         self.instance_name = instance_name
         self.prev_token = prev_token
         self.new_token = new_token
 
     @classmethod
-    def from_line(cls, line):
+    def from_line(cls: Type["PositionCommand"], line: str) -> "PositionCommand":
         stream_name, instance_name, prev_token, new_token = line.split(" ", 3)
         return cls(stream_name, instance_name, int(prev_token), int(new_token))
 
-    def to_line(self):
+    def to_line(self) -> str:
         return " ".join(
             (
                 self.stream_name,
@@ -216,16 +241,18 @@ class ReplicateCommand(Command):
         REPLICATE
     """
 
+    __slots__: List[str] = []
+
     NAME = "REPLICATE"
 
-    def __init__(self):
+    def __init__(self) -> None:
         pass
 
     @classmethod
-    def from_line(cls, line):
+    def from_line(cls: Type[T], line: str) -> T:
         return cls()
 
-    def to_line(self):
+    def to_line(self) -> str:
         return ""
 
 
@@ -245,28 +272,43 @@ class UserSyncCommand(Command):
     Where <state> is either "start" or "end"
     """
 
+    __slots__ = ["instance_id", "user_id", "device_id", "is_syncing", "last_sync_ms"]
+
     NAME = "USER_SYNC"
 
-    def __init__(self, instance_id, user_id, is_syncing, last_sync_ms):
+    def __init__(
+        self,
+        instance_id: str,
+        user_id: str,
+        device_id: Optional[str],
+        is_syncing: bool,
+        last_sync_ms: int,
+    ):
         self.instance_id = instance_id
         self.user_id = user_id
+        self.device_id = device_id
         self.is_syncing = is_syncing
         self.last_sync_ms = last_sync_ms
 
     @classmethod
-    def from_line(cls, line):
-        instance_id, user_id, state, last_sync_ms = line.split(" ", 3)
+    def from_line(cls: Type["UserSyncCommand"], line: str) -> "UserSyncCommand":
+        device_id: Optional[str]
+        instance_id, user_id, device_id, state, last_sync_ms = line.split(" ", 4)
+
+        if device_id == "None":
+            device_id = None
 
         if state not in ("start", "end"):
             raise Exception("Invalid USER_SYNC state %r" % (state,))
 
-        return cls(instance_id, user_id, state == "start", int(last_sync_ms))
+        return cls(instance_id, user_id, device_id, state == "start", int(last_sync_ms))
 
-    def to_line(self):
+    def to_line(self) -> str:
         return " ".join(
             (
                 self.instance_id,
                 self.user_id,
+                str(self.device_id),
                 "start" if self.is_syncing else "end",
                 str(self.last_sync_ms),
             )
@@ -284,16 +326,20 @@ class ClearUserSyncsCommand(Command):
         CLEAR_USER_SYNC <instance_id>
     """
 
+    __slots__ = ["instance_id"]
+
     NAME = "CLEAR_USER_SYNC"
 
-    def __init__(self, instance_id):
+    def __init__(self, instance_id: str):
         self.instance_id = instance_id
 
     @classmethod
-    def from_line(cls, line):
+    def from_line(
+        cls: Type["ClearUserSyncsCommand"], line: str
+    ) -> "ClearUserSyncsCommand":
         return cls(line)
 
-    def to_line(self):
+    def to_line(self) -> str:
         return self.instance_id
 
 
@@ -309,6 +355,8 @@ class FederationAckCommand(Command):
         FEDERATION_ACK <instance_name> <token>
     """
 
+    __slots__ = ["instance_name", "token"]
+
     NAME = "FEDERATION_ACK"
 
     def __init__(self, instance_name: str, token: int):
@@ -316,7 +364,9 @@ class FederationAckCommand(Command):
         self.token = token
 
     @classmethod
-    def from_line(cls, line: str) -> "FederationAckCommand":
+    def from_line(
+        cls: Type["FederationAckCommand"], line: str
+    ) -> "FederationAckCommand":
         instance_name, token = line.split(" ")
         return cls(instance_name, int(token))
 
@@ -332,9 +382,26 @@ class UserIpCommand(Command):
         USER_IP <user_id>, <access_token>, <ip>, <device_id>, <last_seen>, <user_agent>
     """
 
+    __slots__ = [
+        "user_id",
+        "access_token",
+        "ip",
+        "user_agent",
+        "device_id",
+        "last_seen",
+    ]
+
     NAME = "USER_IP"
 
-    def __init__(self, user_id, access_token, ip, user_agent, device_id, last_seen):
+    def __init__(
+        self,
+        user_id: str,
+        access_token: str,
+        ip: str,
+        user_agent: str,
+        device_id: Optional[str],
+        last_seen: int,
+    ):
         self.user_id = user_id
         self.access_token = access_token
         self.ip = ip
@@ -343,14 +410,14 @@ class UserIpCommand(Command):
         self.last_seen = last_seen
 
     @classmethod
-    def from_line(cls, line):
+    def from_line(cls: Type["UserIpCommand"], line: str) -> "UserIpCommand":
         user_id, jsn = line.split(" ", 1)
 
         access_token, ip, user_agent, device_id, last_seen = json_decoder.decode(jsn)
 
         return cls(user_id, access_token, ip, user_agent, device_id, last_seen)
 
-    def to_line(self):
+    def to_line(self) -> str:
         return (
             self.user_id
             + " "
@@ -365,12 +432,19 @@ class UserIpCommand(Command):
             )
         )
 
+    def __repr__(self) -> str:
+        return (
+            f"UserIpCommand({self.user_id!r}, .., {self.ip!r}, "
+            f"{self.user_agent!r}, {self.device_id!r}, {self.last_seen})"
+        )
+
+    def redis_channel_name(self, prefix: str) -> str:
+        return f"{prefix}/USER_IP"
+
 
 class RemoteServerUpCommand(_SimpleCommand):
     """Sent when a worker has detected that a remote server is no longer
     "down" and retry timings should be reset.
-
-    If sent from a client the server will relay to all other workers.
 
     Format::
 
@@ -378,6 +452,49 @@ class RemoteServerUpCommand(_SimpleCommand):
     """
 
     NAME = "REMOTE_SERVER_UP"
+
+
+class LockReleasedCommand(Command):
+    """Sent to inform other instances that a given lock has been dropped.
+
+    Format::
+
+        LOCK_RELEASED ["<instance_name>", "<lock_name>", "<lock_key>"]
+    """
+
+    __slots__ = ["instance_name", "lock_name", "lock_key"]
+
+    NAME = "LOCK_RELEASED"
+
+    def __init__(
+        self,
+        instance_name: str,
+        lock_name: str,
+        lock_key: str,
+    ):
+        self.instance_name = instance_name
+        self.lock_name = lock_name
+        self.lock_key = lock_key
+
+    @classmethod
+    def from_line(cls: Type["LockReleasedCommand"], line: str) -> "LockReleasedCommand":
+        instance_name, lock_name, lock_key = json_decoder.decode(line)
+
+        return cls(instance_name, lock_name, lock_key)
+
+    def to_line(self) -> str:
+        return json_encoder.encode([self.instance_name, self.lock_name, self.lock_key])
+
+
+class NewActiveTaskCommand(_SimpleCommand):
+    """Sent to inform instance handling background tasks that a new active task is available to run.
+
+    Format::
+
+        NEW_ACTIVE_TASK "<task_id>"
+    """
+
+    NAME = "NEW_ACTIVE_TASK"
 
 
 _COMMANDS: Tuple[Type[Command], ...] = (
@@ -393,6 +510,8 @@ _COMMANDS: Tuple[Type[Command], ...] = (
     UserIpCommand,
     RemoteServerUpCommand,
     ClearUserSyncsCommand,
+    LockReleasedCommand,
+    NewActiveTaskCommand,
 )
 
 # Map of command name to command type.
@@ -406,6 +525,7 @@ VALID_SERVER_COMMANDS = (
     ErrorCommand.NAME,
     PingCommand.NAME,
     RemoteServerUpCommand.NAME,
+    LockReleasedCommand.NAME,
 )
 
 # The commands the client is allowed to send
@@ -419,6 +539,7 @@ VALID_CLIENT_COMMANDS = (
     UserIpCommand.NAME,
     ErrorCommand.NAME,
     RemoteServerUpCommand.NAME,
+    LockReleasedCommand.NAME,
 )
 
 

@@ -22,8 +22,6 @@ class TreeCacheNode(dict):
     leaves.
     """
 
-    pass
-
 
 class TreeCache:
     """
@@ -35,17 +33,17 @@ class TreeCache:
         root = {key_1: {key_2: _value}}
     """
 
-    def __init__(self):
-        self.size = 0
+    def __init__(self) -> None:
+        self.size: int = 0
         self.root = TreeCacheNode()
 
-    def __setitem__(self, key, value):
-        return self.set(key, value)
+    def __setitem__(self, key, value) -> None:
+        self.set(key, value)
 
-    def __contains__(self, key):
+    def __contains__(self, key) -> bool:
         return self.get(key, SENTINEL) is not SENTINEL
 
-    def set(self, key, value):
+    def set(self, key, value) -> None:
         if isinstance(value, TreeCacheNode):
             # this would mean we couldn't tell where our tree ended and the value
             # started.
@@ -66,6 +64,15 @@ class TreeCache:
         self.size += 1
 
     def get(self, key, default=None):
+        """When `key` is a full key, fetches the value for the given key (if
+        any).
+
+        If `key` is only a partial key (i.e. a truncated tuple) then returns a
+        `TreeCacheNode`, which can be passed to the `iterate_tree_cache_*`
+        functions to iterate over all entries in the cache with keys that start
+        with the given partial key.
+        """
+
         node = self.root
         for k in key[:-1]:
             node = node.get(k, None)
@@ -73,7 +80,7 @@ class TreeCache:
                 return default
         return node.get(key[-1], default)
 
-    def clear(self):
+    def clear(self) -> None:
         self.size = 0
         self.root = TreeCacheNode()
 
@@ -128,7 +135,10 @@ class TreeCache:
     def values(self):
         return iterate_tree_cache_entry(self.root)
 
-    def __len__(self):
+    def items(self):
+        return iterate_tree_cache_items((), self.root)
+
+    def __len__(self) -> int:
         return self.size
 
 
@@ -141,3 +151,32 @@ def iterate_tree_cache_entry(d):
             yield from iterate_tree_cache_entry(value_d)
     else:
         yield d
+
+
+def iterate_tree_cache_items(key, value):
+    """Helper function to iterate over the leaves of a tree, i.e. a dict of that
+    can contain dicts.
+
+    The provided key is a tuple that will get prepended to the returned keys.
+
+    Example:
+
+        cache = TreeCache()
+        cache[(1, 1)] = "a"
+        cache[(1, 2)] = "b"
+        cache[(2, 1)] = "c"
+
+        tree_node = cache.get((1,))
+
+        items = iterate_tree_cache_items((1,), tree_node)
+        assert list(items) == [((1, 1), "a"), ((1, 2), "b")]
+
+    Returns:
+        A generator yielding key/value pairs.
+    """
+    if isinstance(value, TreeCacheNode):
+        for sub_key, sub_value in value.items():
+            yield from iterate_tree_cache_items((*key, sub_key), sub_value)
+    else:
+        # we've reached a leaf of the tree.
+        yield key, value

@@ -13,15 +13,22 @@
 # limitations under the License.
 
 import logging
+from typing import TYPE_CHECKING, Optional, Tuple, cast
 
 from synapse.api.errors import Codes, NotFoundError, SynapseError
+from synapse.http.server import HttpServer
 from synapse.http.servlet import (
     RestServlet,
     parse_json_object_from_request,
     parse_string,
 )
+from synapse.http.site import SynapseRequest
+from synapse.types import JsonDict
 
 from ._base import client_patterns
+
+if TYPE_CHECKING:
+    from synapse.server import HomeServer
 
 logger = logging.getLogger(__name__)
 
@@ -30,17 +37,16 @@ class RoomKeysServlet(RestServlet):
     PATTERNS = client_patterns(
         "/room_keys/keys(/(?P<room_id>[^/]+))?(/(?P<session_id>[^/]+))?$"
     )
+    CATEGORY = "Encryption requests"
 
-    def __init__(self, hs):
-        """
-        Args:
-            hs (synapse.server.HomeServer): server
-        """
+    def __init__(self, hs: "HomeServer"):
         super().__init__()
         self.auth = hs.get_auth()
         self.e2e_room_keys_handler = hs.get_e2e_room_keys_handler()
 
-    async def on_PUT(self, request, room_id, session_id):
+    async def on_PUT(
+        self, request: SynapseRequest, room_id: Optional[str], session_id: Optional[str]
+    ) -> Tuple[int, JsonDict]:
         """
         Uploads one or more encrypted E2E room keys for backup purposes.
         room_id: the ID of the room the keys are for (optional)
@@ -122,7 +128,7 @@ class RoomKeysServlet(RestServlet):
         requester = await self.auth.get_user_by_req(request, allow_guest=False)
         user_id = requester.user.to_string()
         body = parse_json_object_from_request(request)
-        version = parse_string(request, "version")
+        version = parse_string(request, "version", required=True)
 
         if session_id:
             body = {"sessions": {session_id: body}}
@@ -133,7 +139,9 @@ class RoomKeysServlet(RestServlet):
         ret = await self.e2e_room_keys_handler.upload_room_keys(user_id, version, body)
         return 200, ret
 
-    async def on_GET(self, request, room_id, session_id):
+    async def on_GET(
+        self, request: SynapseRequest, room_id: Optional[str], session_id: Optional[str]
+    ) -> Tuple[int, JsonDict]:
         """
         Retrieves one or more encrypted E2E room keys for backup purposes.
         Symmetric with the PUT version of the API.
@@ -189,8 +197,11 @@ class RoomKeysServlet(RestServlet):
         user_id = requester.user.to_string()
         version = parse_string(request, "version", required=True)
 
-        room_keys = await self.e2e_room_keys_handler.get_room_keys(
-            user_id, version, room_id, session_id
+        room_keys = cast(
+            JsonDict,
+            await self.e2e_room_keys_handler.get_room_keys(
+                user_id, version, room_id, session_id
+            ),
         )
 
         # Convert room_keys to the right format to return.
@@ -215,7 +226,9 @@ class RoomKeysServlet(RestServlet):
 
         return 200, room_keys
 
-    async def on_DELETE(self, request, room_id, session_id):
+    async def on_DELETE(
+        self, request: SynapseRequest, room_id: Optional[str], session_id: Optional[str]
+    ) -> Tuple[int, JsonDict]:
         """
         Deletes one or more encrypted E2E room keys for a user for backup purposes.
 
@@ -231,7 +244,7 @@ class RoomKeysServlet(RestServlet):
 
         requester = await self.auth.get_user_by_req(request, allow_guest=False)
         user_id = requester.user.to_string()
-        version = parse_string(request, "version")
+        version = parse_string(request, "version", required=True)
 
         ret = await self.e2e_room_keys_handler.delete_room_keys(
             user_id, version, room_id, session_id
@@ -241,17 +254,40 @@ class RoomKeysServlet(RestServlet):
 
 class RoomKeysNewVersionServlet(RestServlet):
     PATTERNS = client_patterns("/room_keys/version$")
+    CATEGORY = "Encryption requests"
 
-    def __init__(self, hs):
-        """
-        Args:
-            hs (synapse.server.HomeServer): server
-        """
+    def __init__(self, hs: "HomeServer"):
         super().__init__()
         self.auth = hs.get_auth()
         self.e2e_room_keys_handler = hs.get_e2e_room_keys_handler()
 
-    async def on_POST(self, request):
+    async def on_GET(self, request: SynapseRequest) -> Tuple[int, JsonDict]:
+        """
+        Retrieve the version information about the most current backup version (if any)
+
+        It takes out an exclusive lock on this user's room_key backups, to ensure
+        clients only upload to the current backup.
+
+        Returns 404 if the given version does not exist.
+
+        GET /room_keys/version HTTP/1.1
+        {
+            "version": "12345",
+            "algorithm": "m.megolm_backup.v1",
+            "auth_data": "dGhpcyBzaG91bGQgYWN0dWFsbHkgYmUgZW5jcnlwdGVkIGpzb24K"
+        }
+        """
+        requester = await self.auth.get_user_by_req(request, allow_guest=False)
+        user_id = requester.user.to_string()
+
+        try:
+            info = await self.e2e_room_keys_handler.get_version_info(user_id)
+        except SynapseError as e:
+            if e.code == 404:
+                raise SynapseError(404, "No backup found", Codes.NOT_FOUND)
+        return 200, info
+
+    async def on_POST(self, request: SynapseRequest) -> Tuple[int, JsonDict]:
         """
         Create a new backup version for this user's room_keys with the given
         info.  The version is allocated by the server and returned to the user
@@ -293,22 +329,20 @@ class RoomKeysNewVersionServlet(RestServlet):
 
 
 class RoomKeysVersionServlet(RestServlet):
-    PATTERNS = client_patterns("/room_keys/version(/(?P<version>[^/]+))?$")
+    PATTERNS = client_patterns("/room_keys/version/(?P<version>[^/]+)$")
+    CATEGORY = "Encryption requests"
 
-    def __init__(self, hs):
-        """
-        Args:
-            hs (synapse.server.HomeServer): server
-        """
+    def __init__(self, hs: "HomeServer"):
         super().__init__()
         self.auth = hs.get_auth()
         self.e2e_room_keys_handler = hs.get_e2e_room_keys_handler()
 
-    async def on_GET(self, request, version):
+    async def on_GET(
+        self, request: SynapseRequest, version: str
+    ) -> Tuple[int, JsonDict]:
         """
         Retrieve the version information about a given version of the user's
-        room_keys backup.  If the version part is missing, returns info about the
-        most current backup version (if any)
+        room_keys backup.
 
         It takes out an exclusive lock on this user's room_key backups, to ensure
         clients only upload to the current backup.
@@ -332,26 +366,26 @@ class RoomKeysVersionServlet(RestServlet):
                 raise SynapseError(404, "No backup found", Codes.NOT_FOUND)
         return 200, info
 
-    async def on_DELETE(self, request, version):
+    async def on_DELETE(
+        self, request: SynapseRequest, version: str
+    ) -> Tuple[int, JsonDict]:
         """
         Delete the information about a given version of the user's
-        room_keys backup.  If the version part is missing, deletes the most
-        current backup version (if any). Doesn't delete the actual room data.
+        room_keys backup. Doesn't delete the actual room data.
 
         DELETE /room_keys/version/12345 HTTP/1.1
         HTTP/1.1 200 OK
         {}
         """
-        if version is None:
-            raise SynapseError(400, "No version specified to delete", Codes.NOT_FOUND)
-
         requester = await self.auth.get_user_by_req(request, allow_guest=False)
         user_id = requester.user.to_string()
 
         await self.e2e_room_keys_handler.delete_version(user_id, version)
         return 200, {}
 
-    async def on_PUT(self, request, version):
+    async def on_PUT(
+        self, request: SynapseRequest, version: str
+    ) -> Tuple[int, JsonDict]:
         """
         Update the information about a given version of the user's room_keys backup.
 
@@ -376,16 +410,11 @@ class RoomKeysVersionServlet(RestServlet):
         user_id = requester.user.to_string()
         info = parse_json_object_from_request(request)
 
-        if version is None:
-            raise SynapseError(
-                400, "No version specified to update", Codes.MISSING_PARAM
-            )
-
         await self.e2e_room_keys_handler.update_version(user_id, version, info)
         return 200, {}
 
 
-def register_servlets(hs, http_server):
+def register_servlets(hs: "HomeServer", http_server: HttpServer) -> None:
     RoomKeysServlet(hs).register(http_server)
     RoomKeysVersionServlet(hs).register(http_server)
     RoomKeysNewVersionServlet(hs).register(http_server)

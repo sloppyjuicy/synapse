@@ -15,19 +15,28 @@
 # limitations under the License.
 
 import logging
-from typing import Any
+import re
+from collections import Counter
+from http import HTTPStatus
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
-from synapse.api.errors import InvalidAPICallError, SynapseError
+from synapse.api.errors import Codes, InvalidAPICallError, SynapseError
+from synapse.http.server import HttpServer
 from synapse.http.servlet import (
     RestServlet,
     parse_integer,
     parse_json_object_from_request,
     parse_string,
 )
-from synapse.logging.opentracing import log_kv, set_tag, trace
-from synapse.types import StreamToken
+from synapse.http.site import SynapseRequest
+from synapse.logging.opentracing import log_kv, set_tag
+from synapse.replication.http.devices import ReplicationUploadKeysForUserRestServlet
+from synapse.rest.client._base import client_patterns, interactive_auth_handler
+from synapse.types import JsonDict, StreamToken
+from synapse.util.cancellation import cancellable
 
-from ._base import client_patterns, interactive_auth_handler
+if TYPE_CHECKING:
+    from synapse.server import HomeServer
 
 logger = logging.getLogger(__name__)
 
@@ -38,40 +47,69 @@ class KeyUploadServlet(RestServlet):
     Content-Type: application/json
 
     {
-      "device_keys": {
-        "user_id": "<user_id>",
-        "device_id": "<device_id>",
-        "valid_until_ts": <millisecond_timestamp>,
-        "algorithms": [
-          "m.olm.curve25519-aes-sha2",
-        ]
-        "keys": {
-          "<algorithm>:<device_id>": "<key_base64>",
+        "device_keys": {
+            "user_id": "<user_id>",
+            "device_id": "<device_id>",
+            "valid_until_ts": <millisecond_timestamp>,
+            "algorithms": [
+                "m.olm.curve25519-aes-sha2",
+            ]
+            "keys": {
+                "<algorithm>:<device_id>": "<key_base64>",
+            },
+            "signatures:" {
+                "<user_id>" {
+                    "<algorithm>:<device_id>": "<signature_base64>"
+                }
+            }
         },
-        "signatures:" {
-          "<user_id>" {
-            "<algorithm>:<device_id>": "<signature_base64>"
-      } } },
-      "one_time_keys": {
-        "<algorithm>:<key_id>": "<key_base64>"
-      },
+        "fallback_keys": {
+            "<algorithm>:<device_id>": "<key_base64>",
+            "signed_<algorithm>:<device_id>": {
+                "fallback": true,
+                "key": "<key_base64>",
+                "signatures": {
+                    "<user_id>": {
+                        "<algorithm>:<device_id>": "<key_base64>"
+                    }
+                }
+            }
+        }
+        "one_time_keys": {
+            "<algorithm>:<key_id>": "<key_base64>"
+        },
     }
+
+    response, e.g.:
+
+    {
+        "one_time_key_counts": {
+            "curve25519": 10,
+            "signed_curve25519": 20
+        }
+    }
+
     """
 
     PATTERNS = client_patterns("/keys/upload(/(?P<device_id>[^/]+))?$")
+    CATEGORY = "Encryption requests"
 
-    def __init__(self, hs):
-        """
-        Args:
-            hs (synapse.server.HomeServer): server
-        """
+    def __init__(self, hs: "HomeServer"):
         super().__init__()
         self.auth = hs.get_auth()
         self.e2e_keys_handler = hs.get_e2e_keys_handler()
         self.device_handler = hs.get_device_handler()
 
-    @trace(opname="upload_keys")
-    async def on_POST(self, request, device_id):
+        if hs.config.worker.worker_app is None:
+            # if main process
+            self.key_uploader = self.e2e_keys_handler.upload_keys_for_user
+        else:
+            # then a worker
+            self.key_uploader = ReplicationUploadKeysForUserRestServlet.make_client(hs)
+
+    async def on_POST(
+        self, request: SynapseRequest, device_id: Optional[str]
+    ) -> Tuple[int, JsonDict]:
         requester = await self.auth.get_user_by_req(request, allow_guest=True)
         user_id = requester.user.to_string()
         body = parse_json_object_from_request(request)
@@ -107,8 +145,8 @@ class KeyUploadServlet(RestServlet):
                 400, "To upload keys, you must pass device_id when authenticating"
             )
 
-        result = await self.e2e_keys_handler.upload_keys_for_user(
-            user_id, device_id, body
+        result = await self.key_uploader(
+            user_id=user_id, device_id=device_id, keys=body
         )
         return 200, result
 
@@ -148,17 +186,15 @@ class KeyQueryServlet(RestServlet):
     """
 
     PATTERNS = client_patterns("/keys/query$")
+    CATEGORY = "Encryption requests"
 
-    def __init__(self, hs):
-        """
-        Args:
-            hs (synapse.server.HomeServer):
-        """
+    def __init__(self, hs: "HomeServer"):
         super().__init__()
         self.auth = hs.get_auth()
         self.e2e_keys_handler = hs.get_e2e_keys_handler()
 
-    async def on_POST(self, request):
+    @cancellable
+    async def on_POST(self, request: SynapseRequest) -> Tuple[int, JsonDict]:
         requester = await self.auth.get_user_by_req(request, allow_guest=True)
         user_id = requester.user.to_string()
         device_id = requester.device_id
@@ -194,18 +230,16 @@ class KeyChangesServlet(RestServlet):
     """
 
     PATTERNS = client_patterns("/keys/changes$")
+    CATEGORY = "Encryption requests"
 
-    def __init__(self, hs):
-        """
-        Args:
-            hs (synapse.server.HomeServer):
-        """
+    def __init__(self, hs: "HomeServer"):
         super().__init__()
         self.auth = hs.get_auth()
         self.device_handler = hs.get_device_handler()
-        self.store = hs.get_datastore()
+        self.store = hs.get_datastores().main
 
-    async def on_GET(self, request):
+    @cancellable
+    async def on_GET(self, request: SynapseRequest) -> Tuple[int, JsonDict]:
         requester = await self.auth.get_user_by_req(request, allow_guest=True)
 
         from_token_string = parse_string(request, "from", required=True)
@@ -213,7 +247,9 @@ class KeyChangesServlet(RestServlet):
 
         # We want to enforce they do pass us one, but we ignore it and return
         # changes after the "to" as well as before.
-        set_tag("to", parse_string(request, "to"))
+        #
+        # XXX This does not enforce that "to" is passed.
+        set_tag("to", str(parse_string(request, "to")))
 
         from_token = await StreamToken.from_string(self.store, from_token_string)
 
@@ -244,17 +280,75 @@ class OneTimeKeyServlet(RestServlet):
     """
 
     PATTERNS = client_patterns("/keys/claim$")
+    CATEGORY = "Encryption requests"
 
-    def __init__(self, hs):
+    def __init__(self, hs: "HomeServer"):
         super().__init__()
         self.auth = hs.get_auth()
         self.e2e_keys_handler = hs.get_e2e_keys_handler()
 
-    async def on_POST(self, request):
-        await self.auth.get_user_by_req(request, allow_guest=True)
+    async def on_POST(self, request: SynapseRequest) -> Tuple[int, JsonDict]:
+        requester = await self.auth.get_user_by_req(request, allow_guest=True)
         timeout = parse_integer(request, "timeout", 10 * 1000)
         body = parse_json_object_from_request(request)
-        result = await self.e2e_keys_handler.claim_one_time_keys(body, timeout)
+
+        # Generate a count for each algorithm, which is hard-coded to 1.
+        query: Dict[str, Dict[str, Dict[str, int]]] = {}
+        for user_id, one_time_keys in body.get("one_time_keys", {}).items():
+            for device_id, algorithm in one_time_keys.items():
+                query.setdefault(user_id, {})[device_id] = {algorithm: 1}
+
+        result = await self.e2e_keys_handler.claim_one_time_keys(
+            query, requester.user, timeout, always_include_fallback_keys=False
+        )
+        return 200, result
+
+
+class UnstableOneTimeKeyServlet(RestServlet):
+    """
+    Identical to the stable endpoint (OneTimeKeyServlet) except it allows for
+    querying for multiple OTKs at once and always includes fallback keys in the
+    response.
+
+    POST /keys/claim HTTP/1.1
+    {
+      "one_time_keys": {
+        "<user_id>": {
+          "<device_id>": ["<algorithm>", ...]
+    } } }
+
+    HTTP/1.1 200 OK
+    {
+      "one_time_keys": {
+        "<user_id>": {
+          "<device_id>": {
+            "<algorithm>:<key_id>": "<key_base64>"
+    } } } }
+
+    """
+
+    PATTERNS = [re.compile(r"^/_matrix/client/unstable/org.matrix.msc3983/keys/claim$")]
+    CATEGORY = "Encryption requests"
+
+    def __init__(self, hs: "HomeServer"):
+        super().__init__()
+        self.auth = hs.get_auth()
+        self.e2e_keys_handler = hs.get_e2e_keys_handler()
+
+    async def on_POST(self, request: SynapseRequest) -> Tuple[int, JsonDict]:
+        requester = await self.auth.get_user_by_req(request, allow_guest=True)
+        timeout = parse_integer(request, "timeout", 10 * 1000)
+        body = parse_json_object_from_request(request)
+
+        # Generate a count for each algorithm.
+        query: Dict[str, Dict[str, Dict[str, int]]] = {}
+        for user_id, one_time_keys in body.get("one_time_keys", {}).items():
+            for device_id, algorithms in one_time_keys.items():
+                query.setdefault(user_id, {})[device_id] = Counter(algorithms)
+
+        result = await self.e2e_keys_handler.claim_one_time_keys(
+            query, requester.user, timeout, always_include_fallback_keys=True
+        )
         return 200, result
 
 
@@ -267,13 +361,9 @@ class SigningKeyUploadServlet(RestServlet):
     }
     """
 
-    PATTERNS = client_patterns("/keys/device_signing/upload$", releases=())
+    PATTERNS = client_patterns("/keys/device_signing/upload$", releases=("v3",))
 
-    def __init__(self, hs):
-        """
-        Args:
-            hs (synapse.server.HomeServer): server
-        """
+    def __init__(self, hs: "HomeServer"):
         super().__init__()
         self.hs = hs
         self.auth = hs.get_auth()
@@ -281,20 +371,61 @@ class SigningKeyUploadServlet(RestServlet):
         self.auth_handler = hs.get_auth_handler()
 
     @interactive_auth_handler
-    async def on_POST(self, request):
+    async def on_POST(self, request: SynapseRequest) -> Tuple[int, JsonDict]:
         requester = await self.auth.get_user_by_req(request)
         user_id = requester.user.to_string()
         body = parse_json_object_from_request(request)
 
-        await self.auth_handler.validate_user_via_ui_auth(
-            requester,
-            request,
-            body,
-            "add a device signing key to your account",
-            # Allow skipping of UI auth since this is frequently called directly
-            # after login and it is silly to ask users to re-auth immediately.
-            can_skip_ui_auth=True,
-        )
+        (
+            is_cross_signing_setup,
+            master_key_updatable_without_uia,
+        ) = await self.e2e_keys_handler.check_cross_signing_setup(user_id)
+
+        # Before MSC3967 we required UIA both when setting up cross signing for the
+        # first time and when resetting the device signing key. With MSC3967 we only
+        # require UIA when resetting cross-signing, and not when setting up the first
+        # time. Because there is no UIA in MSC3861, for now we throw an error if the
+        # user tries to reset the device signing key when MSC3861 is enabled, but allow
+        # first-time setup.
+        #
+        # XXX: We now have a get-out clause by which MAS can temporarily mark the master
+        # key as replaceable. It should do its own equivalent of user interactive auth
+        # before doing so.
+        if self.hs.config.experimental.msc3861.enabled:
+            # The auth service has to explicitly mark the master key as replaceable
+            # without UIA to reset the device signing key with MSC3861.
+            if is_cross_signing_setup and not master_key_updatable_without_uia:
+                raise SynapseError(
+                    HTTPStatus.NOT_IMPLEMENTED,
+                    "Resetting cross signing keys is not yet supported with MSC3861",
+                    Codes.UNRECOGNIZED,
+                )
+            # But first-time setup is fine
+
+        elif self.hs.config.experimental.msc3967_enabled:
+            # If we already have a master key then cross signing is set up and we require UIA to reset
+            if is_cross_signing_setup:
+                await self.auth_handler.validate_user_via_ui_auth(
+                    requester,
+                    request,
+                    body,
+                    "reset the device signing key on your account",
+                    # Do not allow skipping of UIA auth.
+                    can_skip_ui_auth=False,
+                )
+            # Otherwise we don't require UIA since we are setting up cross signing for first time
+
+        else:
+            # Previous behaviour is to always require UIA but allow it to be skipped
+            await self.auth_handler.validate_user_via_ui_auth(
+                requester,
+                request,
+                body,
+                "add a device signing key to your account",
+                # Allow skipping of UI auth since this is frequently called directly
+                # after login and it is silly to ask users to re-auth immediately.
+                can_skip_ui_auth=True,
+            )
 
         result = await self.e2e_keys_handler.upload_signing_keys_for_user(user_id, body)
         return 200, result
@@ -329,16 +460,12 @@ class SignaturesUploadServlet(RestServlet):
 
     PATTERNS = client_patterns("/keys/signatures/upload$")
 
-    def __init__(self, hs):
-        """
-        Args:
-            hs (synapse.server.HomeServer): server
-        """
+    def __init__(self, hs: "HomeServer"):
         super().__init__()
         self.auth = hs.get_auth()
         self.e2e_keys_handler = hs.get_e2e_keys_handler()
 
-    async def on_POST(self, request):
+    async def on_POST(self, request: SynapseRequest) -> Tuple[int, JsonDict]:
         requester = await self.auth.get_user_by_req(request, allow_guest=True)
         user_id = requester.user.to_string()
         body = parse_json_object_from_request(request)
@@ -349,10 +476,13 @@ class SignaturesUploadServlet(RestServlet):
         return 200, result
 
 
-def register_servlets(hs, http_server):
+def register_servlets(hs: "HomeServer", http_server: HttpServer) -> None:
     KeyUploadServlet(hs).register(http_server)
     KeyQueryServlet(hs).register(http_server)
     KeyChangesServlet(hs).register(http_server)
     OneTimeKeyServlet(hs).register(http_server)
-    SigningKeyUploadServlet(hs).register(http_server)
-    SignaturesUploadServlet(hs).register(http_server)
+    if hs.config.experimental.msc3983_appservice_otk_claims:
+        UnstableOneTimeKeyServlet(hs).register(http_server)
+    if hs.config.worker.worker_app is None:
+        SigningKeyUploadServlet(hs).register(http_server)
+        SignaturesUploadServlet(hs).register(http_server)

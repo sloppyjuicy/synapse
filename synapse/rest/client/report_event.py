@@ -14,11 +14,18 @@
 
 import logging
 from http import HTTPStatus
+from typing import TYPE_CHECKING, Tuple
 
-from synapse.api.errors import Codes, SynapseError
+from synapse.api.errors import AuthError, Codes, NotFoundError, SynapseError
+from synapse.http.server import HttpServer
 from synapse.http.servlet import RestServlet, parse_json_object_from_request
+from synapse.http.site import SynapseRequest
+from synapse.types import JsonDict
 
 from ._base import client_patterns
+
+if TYPE_CHECKING:
+    from synapse.server import HomeServer
 
 logger = logging.getLogger(__name__)
 
@@ -26,14 +33,17 @@ logger = logging.getLogger(__name__)
 class ReportEventRestServlet(RestServlet):
     PATTERNS = client_patterns("/rooms/(?P<room_id>[^/]*)/report/(?P<event_id>[^/]*)$")
 
-    def __init__(self, hs):
+    def __init__(self, hs: "HomeServer"):
         super().__init__()
         self.hs = hs
         self.auth = hs.get_auth()
         self.clock = hs.get_clock()
-        self.store = hs.get_datastore()
+        self.store = hs.get_datastores().main
+        self._event_handler = self.hs.get_event_handler()
 
-    async def on_POST(self, request, room_id, event_id):
+    async def on_POST(
+        self, request: SynapseRequest, room_id: str, event_id: str
+    ) -> Tuple[int, JsonDict]:
         requester = await self.auth.get_user_by_req(request)
         user_id = requester.user.to_string()
 
@@ -45,11 +55,25 @@ class ReportEventRestServlet(RestServlet):
                 "Param 'reason' must be a string",
                 Codes.BAD_JSON,
             )
-        if not isinstance(body.get("score", 0), int):
+        if type(body.get("score", 0)) is not int:  # noqa: E721
             raise SynapseError(
                 HTTPStatus.BAD_REQUEST,
                 "Param 'score' must be an integer",
                 Codes.BAD_JSON,
+            )
+
+        try:
+            event = await self._event_handler.get_event(
+                requester.user, room_id, event_id, show_redacted=False
+            )
+        except AuthError:
+            # The event exists, but this user is not allowed to access this event.
+            event = None
+
+        if event is None:
+            raise NotFoundError(
+                "Unable to report event: "
+                "it does not exist or you aren't able to see it."
             )
 
         await self.store.add_event_report(
@@ -64,5 +88,5 @@ class ReportEventRestServlet(RestServlet):
         return 200, {}
 
 
-def register_servlets(hs, http_server):
+def register_servlets(hs: "HomeServer", http_server: HttpServer) -> None:
     ReportEventRestServlet(hs).register(http_server)

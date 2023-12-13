@@ -13,18 +13,26 @@
 # limitations under the License.
 
 import logging
+from typing import TYPE_CHECKING
 
 from twisted.web.resource import Resource
 
+from synapse.rest.synapse.client.oidc.backchannel_logout_resource import (
+    OIDCBackchannelLogoutResource,
+)
 from synapse.rest.synapse.client.oidc.callback_resource import OIDCCallbackResource
+
+if TYPE_CHECKING:
+    from synapse.server import HomeServer
 
 logger = logging.getLogger(__name__)
 
 
 class OIDCResource(Resource):
-    def __init__(self, hs):
+    def __init__(self, hs: "HomeServer"):
         Resource.__init__(self)
         self.putChild(b"callback", OIDCCallbackResource(hs))
+        self.putChild(b"backchannel_logout", OIDCBackchannelLogoutResource(hs))
 
 
 __all__ = ["OIDCResource"]

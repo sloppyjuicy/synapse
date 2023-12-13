@@ -34,20 +34,20 @@ logger = logging.getLogger(__name__)
 class CasError(Exception):
     """Used to catch errors when validating the CAS ticket."""
 
-    def __init__(self, error, error_description=None):
+    def __init__(self, error: str, error_description: Optional[str] = None):
         self.error = error
         self.error_description = error_description
 
-    def __str__(self):
+    def __str__(self) -> str:
         if self.error_description:
             return f"{self.error}: {self.error_description}"
         return self.error
 
 
-@attr.s(slots=True, frozen=True)
+@attr.s(slots=True, frozen=True, auto_attribs=True)
 class CasResponse:
-    username = attr.ib(type=str)
-    attributes = attr.ib(type=Dict[str, List[Optional[str]]])
+    username: str
+    attributes: Dict[str, List[Optional[str]]]
 
 
 class CasHandler:
@@ -61,14 +61,16 @@ class CasHandler:
     def __init__(self, hs: "HomeServer"):
         self.hs = hs
         self._hostname = hs.hostname
-        self._store = hs.get_datastore()
+        self._store = hs.get_datastores().main
         self._auth_handler = hs.get_auth_handler()
         self._registration_handler = hs.get_registration_handler()
 
-        self._cas_server_url = hs.config.cas_server_url
-        self._cas_service_url = hs.config.cas_service_url
-        self._cas_displayname_attribute = hs.config.cas_displayname_attribute
-        self._cas_required_attributes = hs.config.cas_required_attributes
+        self._cas_server_url = hs.config.cas.cas_server_url
+        self._cas_service_url = hs.config.cas.cas_service_url
+        self._cas_protocol_version = hs.config.cas.cas_protocol_version
+        self._cas_displayname_attribute = hs.config.cas.cas_displayname_attribute
+        self._cas_required_attributes = hs.config.cas.cas_required_attributes
+        self._cas_enable_registration = hs.config.cas.cas_enable_registration
 
         self._http_client = hs.get_proxied_http_client()
 
@@ -76,13 +78,13 @@ class CasHandler:
         self.idp_id = "cas"
 
         # user-facing name of this auth provider
-        self.idp_name = "CAS"
+        self.idp_name = hs.config.cas.idp_name
 
-        # we do not currently support brands/icons for CAS auth, but this is required by
-        # the SsoIdentityProvider protocol type.
-        self.idp_icon = None
-        self.idp_brand = None
-        self.unstable_idp_brand = None
+        # MXC URI for icon for this auth provider
+        self.idp_icon = hs.config.cas.idp_icon
+
+        # optional brand identifier for this auth provider
+        self.idp_brand = hs.config.cas.idp_brand
 
         self._sso_handler = hs.get_sso_handler()
 
@@ -121,7 +123,10 @@ class CasHandler:
         Returns:
             The parsed CAS response.
         """
-        uri = self._cas_server_url + "/proxyValidate"
+        if self._cas_protocol_version == 3:
+            uri = self._cas_server_url + "/p3/proxyValidate"
+        else:
+            uri = self._cas_server_url + "/proxyValidate"
         args = {
             "ticket": ticket,
             "service": self._build_service_param(service_args),
@@ -131,14 +136,15 @@ class CasHandler:
         except PartialDownloadError as pde:
             # Twisted raises this error if the connection is closed,
             # even if that's being used old-http style to signal end-of-data
+            # Assertion is for mypy's benefit. Error.response is Optional[bytes],
+            # but a PartialDownloadError should always have a non-None response.
+            assert pde.response is not None
             body = pde.response
         except HttpResponseException as e:
             description = (
-                (
-                    'Authorization server responded with a "{status}" error '
-                    "while exchanging the authorization code."
-                ).format(status=e.code),
-            )
+                'Authorization server responded with a "{status}" error '
+                "while exchanging the authorization code."
+            ).format(status=e.code)
             raise CasError("server_error", description) from e
 
         return self._parse_cas_response(body)
@@ -390,4 +396,5 @@ class CasHandler:
             client_redirect_url,
             cas_response_to_user_attributes,
             grandfather_existing_users,
+            registration_enabled=self._cas_enable_registration,
         )

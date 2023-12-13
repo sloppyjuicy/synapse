@@ -16,18 +16,18 @@
 """
 import logging
 import re
-from typing import Iterable, Pattern
+from typing import Any, Awaitable, Callable, Iterable, Pattern, Tuple, TypeVar, cast
 
 from synapse.api.errors import InteractiveAuthIncompleteError
 from synapse.api.urls import CLIENT_API_PREFIX
-from synapse.types import JsonDict
+from synapse.types import JsonDict, StrCollection
 
 logger = logging.getLogger(__name__)
 
 
 def client_patterns(
     path_regex: str,
-    releases: Iterable[int] = (0,),
+    releases: StrCollection = ("r0", "v3"),
     unstable: bool = True,
     v1: bool = False,
 ) -> Iterable[Pattern]:
@@ -43,19 +43,22 @@ def client_patterns(
     Returns:
         An iterable of patterns.
     """
-    patterns = []
+    versions = []
 
-    if unstable:
-        unstable_prefix = CLIENT_API_PREFIX + "/unstable"
-        patterns.append(re.compile("^" + unstable_prefix + path_regex))
     if v1:
-        v1_prefix = CLIENT_API_PREFIX + "/api/v1"
-        patterns.append(re.compile("^" + v1_prefix + path_regex))
-    for release in releases:
-        new_prefix = CLIENT_API_PREFIX + "/r%d" % (release,)
-        patterns.append(re.compile("^" + new_prefix + path_regex))
+        versions.append("api/v1")
+    versions.extend(releases)
+    if unstable:
+        versions.append("unstable")
 
-    return patterns
+    if len(versions) == 1:
+        versions_str = versions[0]
+    elif len(versions) > 1:
+        versions_str = "(" + "|".join(versions) + ")"
+    else:
+        raise RuntimeError("Must have at least one version for a URL")
+
+    return [re.compile("^" + CLIENT_API_PREFIX + "/" + versions_str + path_regex)]
 
 
 def set_timeline_upper_limit(filter_json: JsonDict, filter_timeline_limit: int) -> None:
@@ -76,7 +79,10 @@ def set_timeline_upper_limit(filter_json: JsonDict, filter_timeline_limit: int) 
         )
 
 
-def interactive_auth_handler(orig):
+C = TypeVar("C", bound=Callable[..., Awaitable[Tuple[int, JsonDict]]])
+
+
+def interactive_auth_handler(orig: C) -> C:
     """Wraps an on_POST method to handle InteractiveAuthIncompleteErrors
 
     Takes a on_POST method which returns an Awaitable (errcode, body) response
@@ -91,10 +97,10 @@ def interactive_auth_handler(orig):
         await self.auth_handler.check_auth
     """
 
-    async def wrapped(*args, **kwargs):
+    async def wrapped(*args: Any, **kwargs: Any) -> Tuple[int, JsonDict]:
         try:
             return await orig(*args, **kwargs)
         except InteractiveAuthIncompleteError as e:
             return 401, e.result
 
-    return wrapped
+    return cast(C, wrapped)

@@ -14,15 +14,17 @@
 
 import logging
 from collections import OrderedDict
-from typing import Any, Generic, Optional, TypeVar, Union, overload
+from typing import Any, Generic, Iterable, Optional, TypeVar, Union, overload
 
 import attr
 from typing_extensions import Literal
 
+from twisted.internet import defer
+
 from synapse.config import cache as cache_config
 from synapse.metrics.background_process_metrics import run_as_background_process
 from synapse.util import Clock
-from synapse.util.caches import register_cache
+from synapse.util.caches import EvictionReason, register_cache
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +73,7 @@ class ExpiringCache(Generic[KT, VT]):
         self._expiry_ms = expiry_ms
         self._reset_expiry_on_get = reset_expiry_on_get
 
-        self._cache: OrderedDict[KT, _CacheEntry] = OrderedDict()
+        self._cache: OrderedDict[KT, _CacheEntry[VT]] = OrderedDict()
 
         self.iterable = iterable
 
@@ -81,10 +83,8 @@ class ExpiringCache(Generic[KT, VT]):
             # Don't bother starting the loop if things never expire
             return
 
-        def f():
-            return run_as_background_process(
-                "prune_cache_%s" % self._cache_name, self._prune_cache
-            )
+        def f() -> "defer.Deferred[None]":
+            return run_as_background_process("prune_cache", self._prune_cache)
 
         self._clock.looping_call(f, self._expiry_ms / 2)
 
@@ -98,9 +98,12 @@ class ExpiringCache(Generic[KT, VT]):
         while self._max_size and len(self) > self._max_size:
             _key, value = self._cache.popitem(last=False)
             if self.iterable:
-                self.metrics.inc_evictions(len(value.value))
+                # type-ignore, here and below: if self.iterable is true, then the value
+                # type VT should be Sized (i.e. have a __len__ method). We don't enforce
+                # this via the type system at present.
+                self.metrics.inc_evictions(EvictionReason.size, len(value.value))  # type: ignore[arg-type]
             else:
-                self.metrics.inc_evictions()
+                self.metrics.inc_evictions(EvictionReason.size)
 
     def __getitem__(self, key: KT) -> VT:
         try:
@@ -131,6 +134,11 @@ class ExpiringCache(Generic[KT, VT]):
                 raise KeyError(key)
             return default
 
+        if self.iterable:
+            self.metrics.inc_evictions(EvictionReason.invalidation, len(value.value))  # type: ignore[arg-type]
+        else:
+            self.metrics.inc_evictions(EvictionReason.invalidation)
+
         return value.value
 
     def __contains__(self, key: KT) -> bool:
@@ -157,7 +165,7 @@ class ExpiringCache(Generic[KT, VT]):
             self[key] = value
             return value
 
-    def _prune_cache(self) -> None:
+    async def _prune_cache(self) -> None:
         if not self._expiry_ms:
             # zero expiry time means don't expire. This should never get called
             # since we have this check in start too.
@@ -175,9 +183,9 @@ class ExpiringCache(Generic[KT, VT]):
         for k in keys_to_delete:
             value = self._cache.pop(k)
             if self.iterable:
-                self.metrics.inc_evictions(len(value.value))
+                self.metrics.inc_evictions(EvictionReason.time, len(value.value))  # type: ignore[arg-type]
             else:
-                self.metrics.inc_evictions()
+                self.metrics.inc_evictions(EvictionReason.time)
 
         logger.debug(
             "[%s] _prune_cache before: %d, after len: %d",
@@ -188,7 +196,8 @@ class ExpiringCache(Generic[KT, VT]):
 
     def __len__(self) -> int:
         if self.iterable:
-            return sum(len(entry.value) for entry in self._cache.values())
+            g: Iterable[int] = (len(entry.value) for entry in self._cache.values())  # type: ignore[arg-type]
+            return sum(g)
         else:
             return len(self._cache)
 
@@ -200,7 +209,7 @@ class ExpiringCache(Generic[KT, VT]):
         items from the cache.
 
         Returns:
-            bool: Whether the cache changed size or not.
+            Whether the cache changed size or not.
         """
         new_size = int(self._original_max_size * factor)
         if new_size != self._max_size:
@@ -210,7 +219,7 @@ class ExpiringCache(Generic[KT, VT]):
         return False
 
 
-@attr.s(slots=True)
-class _CacheEntry:
-    time = attr.ib(type=int)
-    value = attr.ib()
+@attr.s(slots=True, auto_attribs=True)
+class _CacheEntry(Generic[VT]):
+    time: int
+    value: VT
